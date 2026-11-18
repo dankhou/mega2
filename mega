@@ -1,0 +1,131 @@
+/*
+  Fan RPM Meter
+  Board : Arduino Mega 2560
+  Sensor: HW-201 IR reflective obstacle sensor (LM393, OUT goes LOW on detect)
+  Display: 1602 LCD with PCF8574T I2C backpack
+
+  LIBRARY: Arduino IDE > Tools > Manage Libraries > search "LiquidCrystal I2C"
+           > install the one by Frank de Brabander
+
+  WIRING
+  ------
+  IR sensor     VCC -> 5V   GND -> GND   OUT -> D2 (interrupt pin)
+  LCD backpack  GND -> GND  VCC -> 5V    SDA -> D20 (SDA)   SCL -> D21 (SCL)
+
+  Contrast: turn the blue pot on the back of the LCD backpack.
+
+  HOW IT MEASURES
+  ---------------
+  Every time the reflective mark passes the sensor, OUT pulls LOW and an
+  interrupt counts it. Every UPDATE_MS the sketch takes the exact time span
+  between pulses and converts it to RPM:
+      RPM = pulses * 60,000,000 / (time_us * PULSES_PER_REV)
+*/
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// ================= USER SETTINGS =================
+const uint8_t  SENSOR_PIN       = 2;        // Mega interrupt pins: 2, 3, 18, 19, 20, 21
+const uint8_t  PULSES_PER_REV   = 1;        // 1 = one reflective strip; else = number of blades
+const uint32_t DEBOUNCE_US      = 1000;     // ignore edges closer than this (sensor chatter)
+                                            // 1000 us -> max 60,000 pulses/min
+                                            // lower it only for very fast fans / many blades
+const uint32_t UPDATE_MS        = 500;      // display refresh period
+const uint32_t TIMEOUT_US       = 2000000UL;// no pulse for 2 s -> show 0 RPM
+const float    SMOOTHING        = 0.5;      // 0 = no smoothing, 0.9 = heavy smoothing
+
+const uint8_t  LCD_ADDRESS      = 0x27;     // PCF8574T default. If screen stays blank, try 0x3F
+// =================================================
+
+LiquidCrystal_I2C lcd(LCD_ADDRESS, 16, 2);
+
+volatile uint32_t pulseCount  = 0;
+volatile uint32_t lastPulseUs = 0;
+
+uint32_t prevCount   = 0;
+uint32_t prevPulseUs = 0;
+bool     havePrev    = false;
+float    rpm         = 0;
+uint32_t lastUpdate  = 0;
+
+void onPulse() {
+  uint32_t now = micros();
+  if (now - lastPulseUs >= DEBOUNCE_US) {
+    lastPulseUs = now;
+    pulseCount++;
+  }
+}
+
+// Prints an unsigned value right-aligned in a fixed width
+void printPadded(uint32_t value, uint8_t width) {
+  char buf[11];
+  ultoa(value, buf, 10);
+  for (uint8_t i = strlen(buf); i < width; i++) lcd.print(' ');
+  lcd.print(buf);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  lcd.init();
+  lcd.backlight();
+  lcd.print("Fan RPM Meter");
+  lcd.setCursor(0, 1);
+  lcd.print("Waiting...");
+
+  pinMode(SENSOR_PIN, INPUT_PULLUP);        // module has its own pull-up; this is extra safety
+  attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), onPulse, FALLING);
+
+  delay(1000);
+  lcd.clear();
+  lastUpdate = millis();
+}
+
+void loop() {
+  if (millis() - lastUpdate < UPDATE_MS) return;
+  lastUpdate += UPDATE_MS;
+
+  // Copy shared variables safely
+  noInterrupts();
+  uint32_t count = pulseCount;
+  uint32_t tLast = lastPulseUs;
+  interrupts();
+
+  uint32_t newPulses = count - prevCount;
+
+  if (newPulses > 0) {
+    if (havePrev) {
+      uint32_t dt = tLast - prevPulseUs;    // exact time spanned by newPulses periods
+      if (dt > 0) {
+        float instant = (newPulses * 60.0e6) / ((float)dt * PULSES_PER_REV);
+        rpm = (rpm == 0) ? instant : (SMOOTHING * rpm + (1.0 - SMOOTHING) * instant);
+      }
+    }
+    prevCount   = count;
+    prevPulseUs = tLast;
+    havePrev    = true;
+  } else if (micros() - tLast > TIMEOUT_US) {
+    rpm      = 0;                           // fan stopped or sensor lost the mark
+    havePrev = false;                       // next pulse starts a fresh measurement
+    prevCount = count;
+  }
+
+  uint32_t rpmInt = (uint32_t)(rpm + 0.5);
+  float revPerSec = rpm / 60.0;
+
+  // Line 1: RPM
+  lcd.setCursor(0, 0);
+  lcd.print("RPM: ");
+  printPadded(rpmInt, 7);
+  lcd.print("    ");
+
+  // Line 2: rev/s and total pulses
+  lcd.setCursor(0, 1);
+  lcd.print(revPerSec, 1);
+  lcd.print(" rev/s       ");
+
+  // Serial output (works with Tools > Serial Plotter at 115200 baud)
+  Serial.print("RPM:");
+  Serial.println(rpmInt);
+}
