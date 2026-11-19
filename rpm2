@@ -1,0 +1,175 @@
+*
+  Fan RPM Meter + Temperature / Humidity
+  Board  : Arduino Mega 2560
+  Sensors: HW-201 IR reflective sensor (LM393, OUT goes LOW on detect)
+           DHT11 temperature / humidity sensor (set DHT_TYPE to DHT22 if you upgrade)
+  Display: 1602 LCD with PCF8574T I2C backpack
+
+  LIBRARIES (Arduino IDE > Tools > Manage Libraries):
+    - "LiquidCrystal I2C"  by Frank de Brabander
+    - "DHT sensor library" by Adafruit  (accept the prompt to also install "Adafruit Unified Sensor")
+
+  WIRING
+  ------
+  IR sensor     VCC -> 5V   GND -> GND   OUT -> D2 (interrupt pin)
+  LCD backpack  VCC -> 5V   GND -> GND   SDA -> D20   SCL -> D21
+  DHT11 module  +   -> 5V   -   -> GND   S/DATA -> D4
+     (bare 4-pin DHT11: pin1 VCC, pin2 DATA + 10k resistor DATA->5V, pin3 not used, pin4 GND)
+
+  LCD LAYOUT
+  ----------
+  RPM:      3450
+  T:24.0C  H:45%
+
+  Contrast: turn the blue pot on the back of the LCD backpack.
+*/
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <DHT.h>
+
+// ================= USER SETTINGS =================
+const uint8_t  SENSOR_PIN       = 2;        // Mega interrupt pins: 2, 3, 18, 19, 20, 21
+const uint8_t  PULSES_PER_REV   = 5;        // counting all 5 blades (set 1 if using a single reflective strip)
+const uint32_t DEBOUNCE_US      = 1000;     // ignore edges closer than this (sensor chatter)
+                                            // 1000 us -> max 60,000 pulses/min = 12,000 RPM at 5 blades
+const uint32_t UPDATE_MS        = 500;      // RPM display refresh period
+const uint32_t TIMEOUT_US       = 2000000UL;// no pulse for 2 s -> show 0 RPM
+const float    SMOOTHING        = 0.5;      // 0 = no smoothing, 0.9 = heavy smoothing
+
+const uint8_t  LCD_ADDRESS      = 0x27;     // PCF8574T default. If screen stays blank, try 0x3F
+
+const uint8_t  DHT_PIN          = 4;
+#define        DHT_TYPE           DHT11     // change to DHT22 for the -40..80 C sensor
+const uint32_t DHT_INTERVAL_MS  = 2000;     // DHT11 max 1 read/s, DHT22 1 read/2 s
+// =================================================
+
+LiquidCrystal_I2C lcd(LCD_ADDRESS, 16, 2);
+DHT dht(DHT_PIN, DHT_TYPE);
+
+volatile uint32_t pulseCount  = 0;
+volatile uint32_t lastPulseUs = 0;
+
+uint32_t prevCount   = 0;
+uint32_t prevPulseUs = 0;
+bool     havePrev    = false;
+float    rpm         = 0;
+uint32_t lastUpdate  = 0;
+
+float    tempC       = NAN;
+float    humidity    = NAN;
+uint32_t lastDhtRead = 0;
+
+void onPulse() {
+  uint32_t now = micros();
+  if (now - lastPulseUs >= DEBOUNCE_US) {
+    lastPulseUs = now;
+    pulseCount++;
+  }
+}
+
+// Prints an unsigned value right-aligned in a fixed width
+void printPadded(uint32_t value, uint8_t width) {
+  char buf[11];
+  ultoa(value, buf, 10);
+  for (uint8_t i = strlen(buf); i < width; i++) lcd.print(' ');
+  lcd.print(buf);
+}
+
+void readDht() {
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();          // Celsius
+  if (!isnan(h) && !isnan(t)) {
+    humidity = h;
+    tempC    = t;
+  } else {
+    humidity = NAN;                         // shows "--" until the next good read
+    tempC    = NAN;
+  }
+}
+
+void updateRpm() {
+  noInterrupts();
+  uint32_t count = pulseCount;
+  uint32_t tLast = lastPulseUs;
+  interrupts();
+
+  uint32_t newPulses = count - prevCount;
+
+  if (newPulses > 0) {
+    if (havePrev) {
+      uint32_t dt = tLast - prevPulseUs;    // exact time spanned by newPulses periods
+      if (dt > 0) {
+        float instant = (newPulses * 60.0e6) / ((float)dt * PULSES_PER_REV);
+        rpm = (rpm == 0) ? instant : (SMOOTHING * rpm + (1.0 - SMOOTHING) * instant);
+      }
+    }
+    prevCount   = count;
+    prevPulseUs = tLast;
+    havePrev    = true;
+  } else if (micros() - tLast > TIMEOUT_US) {
+    rpm       = 0;                          // fan stopped or sensor lost the blades
+    havePrev  = false;
+    prevCount = count;
+  }
+}
+
+void drawScreen() {
+  uint32_t rpmInt = (uint32_t)(rpm + 0.5);
+
+  // Line 1: "RPM:      3450  "
+  lcd.setCursor(0, 0);
+  lcd.print("RPM: ");
+  printPadded(rpmInt, 9);
+  lcd.print("  ");
+
+  // Line 2: "T:24.0C  H:45%  "
+  lcd.setCursor(0, 1);
+  lcd.print("T:");
+  if (isnan(tempC)) lcd.print("--.-");
+  else              lcd.print(tempC, 1);
+  lcd.print("C H:");
+  if (isnan(humidity)) lcd.print("--");
+  else                 lcd.print((int)(humidity + 0.5));
+  lcd.print("%   ");
+
+  // Serial output (Tools > Serial Plotter at 115200 baud)
+  Serial.print("RPM:");    Serial.print(rpmInt);
+  Serial.print(" TempC:"); Serial.print(isnan(tempC) ? 0 : tempC, 1);
+  Serial.print(" RH:");    Serial.println(isnan(humidity) ? 0 : humidity, 0);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  lcd.init();
+  lcd.backlight();
+  lcd.print("Fan RPM Meter");
+  lcd.setCursor(0, 1);
+  lcd.print("Starting...");
+
+  dht.begin();
+
+  pinMode(SENSOR_PIN, INPUT_PULLUP);        // module has its own pull-up; this is extra safety
+  attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), onPulse, FALLING);
+
+  delay(1500);                              // DHT needs ~1 s after power-up
+  readDht();
+  lastDhtRead = millis();
+  lcd.clear();
+  lastUpdate = millis();
+}
+
+void loop() {
+  // DHT read briefly pauses interrupts (~4 ms); done only every 2 s so RPM is barely affected
+  if (millis() - lastDhtRead >= DHT_INTERVAL_MS) {
+    lastDhtRead += DHT_INTERVAL_MS;
+    readDht();
+  }
+
+  if (millis() - lastUpdate >= UPDATE_MS) {
+    lastUpdate += UPDATE_MS;
+    updateRpm();
+    drawScreen();
+  }
+}
